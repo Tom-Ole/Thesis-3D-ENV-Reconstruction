@@ -1,0 +1,19 @@
+# GUI framework (the app is built on Qt for Python / PySide6).
+PySide6>=6.6
+
+# Boston Dynamics Spot SDK. bosdyn-client pulls in bosdyn-api and bosdyn-core.
+# Used for authentication, image capture and point-cloud (EAP LiDAR) capture.
+bosdyn-client>=4.0.0
+
+# Image decoding / rotation / encoding (raw + depth images).
+opencv-python>=4.8
+
+# Array handling and binary PLY point-cloud serialization.
+numpy>=1.24
+
+# Loads robot credentials / output dir from a .env file (see .env.example).
+python-dotenv>=1.0
+
+# NOTE: The Boston Dynamics SDK currently publishes wheels for Python 3.8-3.12.
+# If you are on a newer interpreter (e.g. 3.13/3.14), create the venv with a
+# 3.12 interpreter so `bosdyn-client` installs cleanly.

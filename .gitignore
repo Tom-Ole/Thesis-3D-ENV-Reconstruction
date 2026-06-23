@@ -1,0 +1,13 @@
+.vscode/
+.claude/
+
+.venv_reconstruction/
+
+__pycache__/
+.pytest_cache/
+
+captures/
+
+recordings/
+
+.env

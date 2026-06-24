@@ -37,11 +37,11 @@ class Config:
     state_sample_rate: float = 50.0  # hz
     prefer_state_streaming: bool = True  # use 333Hz IMU stream when present
 
-    # Rotating the body fisheye images upright is DISPLAY-ONLY and breaks the
-    # correspondence between pixels and the reported camera intrinsics. Keep it
-    # OFF for calibration / reconstruction so saved images match the intrinsics
-    # and distortion model recorded in metadata.
-    apply_camera_rotation: bool = False
+    # Rotate front fisheye images upright on save. Note: this changes pixel
+    # coordinates so saved images no longer match the raw intrinsics stored in
+    # metadata. Disable if you need unrotated images for calibration tools that
+    # consume the intrinsics directly.
+    apply_camera_rotation: bool = True
     available_cameras: list[str] = field(
         default_factory=lambda: list(_AVAILABLE_CAMERA_SOURCES)
     )

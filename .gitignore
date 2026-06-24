@@ -2,6 +2,7 @@
 .claude/
 
 .venv_reconstruction/
+.venv/
 
 __pycache__/
 .pytest_cache/

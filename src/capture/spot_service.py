@@ -157,16 +157,27 @@ class SpotService:
         self._state_stream_client = None
         self.connected = False
 
+    # The EAP Velodyne payload registers this exact name in Spot's service
+    # directory. PointCloudClient.default_service_name is 'point-cloud' (the
+    # generic SDK name) which does not appear in the directory on an EAP robot,
+    # causing ensure_client to raise UnregisteredServiceNameError.
+    _VELODYNE_SERVICE_NAME = "velodyne-point-cloud"
+
     def _try_point_cloud_client(
         self, robot, log: LogFn
     ) -> Optional[PointCloudClientWrapper]:
         """Create the point-cloud client if the EAP service is available."""
         try:
-            pc_client = robot.ensure_client(PointCloudClient.default_service_name)
+            pc_client = robot.ensure_client(self._VELODYNE_SERVICE_NAME)
             pc_client.list_point_cloud_sources()  # verify it actually responds
             log("Point-cloud / LiDAR service detected (EAP payload).")
             return PointCloudClientWrapper(pc_client)
-        except Exception:  # noqa: BLE001 - optional payload, degrade gracefully
+        except Exception as exc:  # noqa: BLE001 - optional payload, degrade gracefully
+            logger.warning(
+                "No point-cloud / LiDAR service found (%s: %s); image capture only.",
+                type(exc).__name__,
+                exc,
+            )
             log("No point-cloud / LiDAR service found; image capture only.")
             return None
 

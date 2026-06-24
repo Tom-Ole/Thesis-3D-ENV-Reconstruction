@@ -19,19 +19,26 @@ from src.models import CapturedImage, ImageSourceInfo
 
 logger = logging.getLogger(__name__)
 
-# Body fisheye cameras are physically mounted rotated; rotate captures upright.
-# Sources not listed here (depth, hand, etc.) are saved as-is.
 CAMERA_ROTATION = {
     "back_fisheye_image": None,
     "left_fisheye_image": None,
-    "right_fisheye_image": cv2.ROTATE_180,
+    "right_fisheye_image": None,
     "frontleft_fisheye_image": cv2.ROTATE_90_CLOCKWISE,
     "frontright_fisheye_image": cv2.ROTATE_90_CLOCKWISE,
+    "frontleft_depth": cv2.ROTATE_90_CLOCKWISE,
+    "frontleft_depth_in_visual_frame": cv2.ROTATE_90_CLOCKWISE,
+    "frontright_depth": cv2.ROTATE_90_CLOCKWISE,
+    "frontright_depth_in_visual_frame": cv2.ROTATE_90_CLOCKWISE,
+    "back_depth": None,
+    "back_depth_in_visual_frame": None,
+    "left_depth": None,
+    "left_depth_in_visual_frame": None,
+    "right_depth": None,
+    "right_depth_in_visual_frame": None,
 }
 
 _ROTATION_NAMES = {
     cv2.ROTATE_90_CLOCKWISE: "ROTATE_90_CLOCKWISE",
-    cv2.ROTATE_180: "ROTATE_180",
     cv2.ROTATE_90_COUNTERCLOCKWISE: "ROTATE_90_COUNTERCLOCKWISE",
 }
 
@@ -47,6 +54,7 @@ class ImageClientWrapper:
         """Return the image sources currently advertised by the robot."""
         sources = []
         for src in self.client.list_image_sources():
+            logger.debug(src)
             sources.append(
                 ImageSourceInfo(
                     name=src.name,
@@ -62,13 +70,7 @@ class ImageClientWrapper:
         return sources
 
     def get_camera_models(self) -> dict:
-        """Return per-source camera models (intrinsics + distortion).
-
-        Used to build the session calibration manifest. The model is read
-        straight from the robot's advertised :class:`ImageSource`, giving the
-        factory/nominal calibration that the user's own OpenCV calibration can
-        validate or refine.
-        """
+        """Return per-source camera models (intrinsics + distortion)."""
         models = {}
         for src in self.client.list_image_sources():
             models[src.name] = {
@@ -86,12 +88,20 @@ class ImageClientWrapper:
         self,
         source_names: List[str],
         quality_percent: float = 75.0,
-        pixel_format: Optional[int] = None,
     ) -> List[CapturedImage]:
         """Capture and decode images from the given sources in one request."""
         requests = [
             build_image_request(
-                name, quality_percent=quality_percent, pixel_format=pixel_format
+                name,
+                quality_percent=quality_percent,
+                # Depth cameras expose DEPTH_U16 and don't support RGB; all
+                # other sources (fisheye, visual) are requested as RGB so the
+                # saved files are always 3-channel even on monochrome sensors.
+                pixel_format=(
+                    None
+                    if "depth" in name
+                    else image_pb2.Image.PIXEL_FORMAT_RGB_U8
+                ),
             )
             for name in source_names
         ]
@@ -122,8 +132,10 @@ class ImageClientWrapper:
 
         if image.format == image_pb2.Image.FORMAT_JPEG:
             if rotation is not None:
+                # IMREAD_COLOR forces a 3-channel BGR output even when the
+                # JPEG payload is greyscale, so saved files are always RGB.
                 arr = cv2.imdecode(
-                    np.frombuffer(image.data, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                    np.frombuffer(image.data, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
                 captured.array = cv2.rotate(arr, rotation)
                 captured.rotation_applied = _ROTATION_NAMES.get(rotation)
@@ -182,13 +194,7 @@ def _intrinsics_dict(intrinsics) -> dict:
 
 
 def _extract_camera_model(source) -> dict:
-    """Pull the camera model (intrinsics + distortion) from an ImageSource.
-
-    Handles both the plain ``pinhole`` model and ``pinhole_brown_conrady``
-    (which adds Brown-Conrady distortion coefficients k1,k2,k3,p1,p2 needed for
-    undistortion). Field access is defensive so this degrades gracefully across
-    SDK versions; unknown models fall back to ``type: unknown``.
-    """
+    """Pull the camera model (intrinsics + distortion) from an ImageSource."""
     try:
         if source.HasField("pinhole_brown_conrady"):
             pbc = source.pinhole_brown_conrady
@@ -218,7 +224,6 @@ def _timestamp_to_iso(timestamp) -> Optional[str]:
 
 
 def _timestamp_to_nsec(timestamp) -> Optional[int]:
-    """Robot-clock nanoseconds, the common timeline for cross-sensor sync."""
     try:
         return int(timestamp.ToNanoseconds())
     except Exception:  # pragma: no cover - defensive

@@ -86,8 +86,11 @@ rotation + optional/skippable fisheye → camera manifest), `step1_odometry.py`,
 `step2_mapping.py`, `step3_pose_graph.py`, `step4_surfels.py`, `step6_mesh.py`
 (LiDAR-only baseline mesh), `step_b1_image_poses.py` (image branch: sync + refine
 camera poses), `step_b2_depth.py` (dense monocular metric depth per image),
-`step_b3_align.py` (LiDAR-anchored metric alignment of that depth).
-Remaining image-branch + fusion modules are new (planned below).
+`step_b3_align.py` (LiDAR-anchored metric alignment of that depth),
+`step_b4_cloud.py` (back-project → dense colored image cloud),
+`step_c_fuse.py` (LiDAR × image geometry fusion → `fused_cloud`),
+`step_d_mesh.py` (TSDF/Poisson mesh → `mesh_fused.ply`; TSDF default = clean).
+Remaining: Phase E textures the mesh (multi-view projection).
 Run env: `.venv` (Python 3.11; open3d, numpy, scipy, matplotlib). Image branch will add
 deps (see Phase B).
 
@@ -210,44 +213,101 @@ Depends on **Step 0 calibration** (below). Uses the known LiDAR poses, so no SfM
   affine+grid on the fly) and `.confidence()`; merged transparently by
   `common.load_camera_manifest`. Checks in `output/depth/debug/<stem>_align.jpg`.
 
-### B4 — Back-project to dense image cloud ⬜  ← NEXT
-- Inputs wired: `Camera.read_depth_aligned()` (B3 metric depth), `.confidence()`
-  (per-pixel weight), `.read_image()` (RGB), `.pose` (B1 refined odom pose).
-- Unproject corrected depth (+ RGB) per image → dense colored point cloud in the
-  refined odom frame (`X_odom = pose · K⁻¹·[u,v,1]·z`). Same frame as the LiDAR.
-- Carry per-point confidence; threshold/voxel-downsample to keep it tractable
-  (1060 images × ~300k px is huge — subsample per image and across the 5 Hz
-  near-stationary frames).
+### B4 — Back-project to dense image cloud ✅ (`step_b4_cloud.py`)
+- Unproject each image's B3 aligned depth → refined odom frame
+  (`X_odom = pose · z·K⁻¹·[u,v,1]`), same frame as the LiDAR map.
+- **Normals from the depth map** (neighbour cross-product, oriented toward the
+  camera — correctly oriented for free, good for Phase D meshing).
+- **Confidence taper (small B3 addition):** B3 now stores `anchor_zmax` (95th-pct
+  anchored depth, median 3.0 m); `Camera.confidence()` decays to 0 between
+  `anchor_zmax` and 1.5× it, so extrapolated far-depth never enters the cloud.
+  This pulled the cloud's x-extent from −9.4 m back inside the LiDAR's −7.3 m.
+- **Streaming confidence-weighted voxel hash** (1.5 cm): per-image reduce, then
+  one vectorised group-by → memory bounded by occupied voxels. **18.6 M pts from
+  978/1060 images → 3.89 M voxels in ~90 s.** The 82 dropped images are exactly
+  the low-quality frames B3 flagged (tapered to zero confidence — working as
+  designed).
+- **Gap-fill confirmed:** 518k floor points recovered below the LiDAR z-band
+  [1.88, 4.78] — geometry the Velodyne never saw. Overlap-surface alignment is
+  consistent with B3's 18 mm (the residual NN-to-LiDAR distance is dominated by
+  inter-ring gaps + the map's own 5 cm voxels, not misalignment).
+- ⚠️ Known noise: radial smearing from grazing-angle / uncertain monocular depth
+  — left for Phase C (LiDAR fusion + statistical/radius outlier removal). A
+  view-incidence-angle confidence term is a candidate refinement.
+- **Output:** `output/fusion/image_cloud.npz` (`points, colors, normals,
+  confidence`) + `image_cloud.ply` (view). Read via `common.load_image_cloud`.
 
 **New deps for Phase B:** torch + a depth model (learned path) or COLMAP/OpenMVS (MVS path),
 plus OpenCV for undistort/projection.
 
 ---
 
-## PHASE C — Geometry Fusion ⬜  ← LiDAR × image into one dense cloud
+## PHASE C — Geometry Fusion ✅ (`step_c_fuse.py`)  ← LiDAR × image into one dense cloud
 
-- Merge LiDAR points (metric, trusted) + image points (dense, fill gaps).
-- Confidence-weighted consolidation: LiDAR wins ties on metric position; images supply
-  surfaces LiDAR missed (holes in walls/ceiling/floor).
-- Consolidate via voxel hashing or TSDF; statistical/radius outlier removal.
-- Output: dense fused point cloud / surfels for meshing.
+- **LiDAR scaffold rebuilt in the B1 frame:** the saved `surfels.npz` is in a
+  mixed Step-1/Step-3 frame (~2.6 cm off the image cloud), so Phase C re-places
+  the scans with `trajectory_poses_world` (Step-1 dense) and reuses
+  `step4_surfels.fuse_surfels` → 71.5k oriented surfels, frame-consistent.
+- **Image cloud pre-cleaned** (radius-outlier, dropped 94.5k smear pts).
+- **Confidence-weighted voxel hash @ 2 cm, hard per-voxel LiDAR-wins:** a voxel
+  with any LiDAR takes its geometry from LiDAR; image-only voxels are
+  confidence-weighted image points. Geometry and colour use separate weights so
+  colourless LiDAR never darkens image colour (LiDAR-only voxels go grey, pending
+  Phase E texture).
+- **Cleanup:** drop weak image-only voxels + radius-outlier (LiDAR protected).
+- **Globally consistent normals:** oriented toward the trajectory centroid
+  (indoor inside-out scan → all normals face the interior) so Poisson behaves.
+- **Result:** **1.27 M fused voxels** (71.5k LiDAR-backed + 1.20 M image-only),
+  111.8k floor voxels recovered below the LiDAR z-band, bbox hugging the LiDAR
+  extent, in ~19 s. Provenance render confirms LiDAR backbone + image gap-fill
+  coexisting cleanly.
+- ⚠️ Minor residual: grazing-angle LiDAR ring streaks at the edges (LiDAR-backed,
+  so protected here) — Phase D density-trim + bbox-crop remove them.
+- **Output:** `output/fusion/fused_cloud.npz` (`points, colors, normals,
+  confidence, is_lidar`) + `fused_cloud.ply`. Read via `common.load_fused_cloud`;
+  drops straight into `step6_mesh.poisson_mesh`.
 
 ---
 
-## PHASE D — Surface + Mesh 🟡 (`step6_mesh.py` = LiDAR-only baseline)
+## PHASE D — Surface + Mesh ✅ (`step_d_mesh.py`; `step6_mesh.py` = LiDAR-only baseline)
 
-- Mesh the **fused** cloud: Poisson (have it) or TSDF + Marching Cubes (cleaner indoors,
-  esp. once depth is dense).
-- Cleanup: remove small components, fill holes, Taubin smoothing, recompute normals.
-- Current `step6_mesh.py` runs Poisson on LiDAR-only surfels → `mesh.ply` (235k tris,
-  coarse — baseline only; will look much better on the fused cloud).
+Two paths in `step_d_mesh.py`; **TSDF is the default** because Poisson-on-points
+was too noisy.
+
+- **TSDF + Marching Cubes (DEFAULT, the clean mesh).** Volumetrically integrate
+  the B3 aligned depth maps into a truncated SDF (`ScalableTSDFVolume`, voxel
+  3 cm, trunc 12 cm), confidence-gated per pixel (drop conf < 0.45) and per frame
+  (skip B3 `fit_quality` < 0.35), then Marching Cubes. Each surface voxel
+  averages many overlapping observations → **flat walls, watertight-ish, RGB
+  baked in**. Cleanup: small-component removal + Taubin (8). Result: **614 k tris,
+  321 k verts, coloured, in ~20 s**, 834/1060 frames integrated. Walls are flat
+  (vs Poisson's "tinfoil"); residual feathery fringe only at open room boundaries
+  + grazing-angle floor.
+- **Poisson (baseline, `method="poisson"`).** Poisson on Phase C's `fused_cloud`
+  (reuses `step6`): depth 10 → density trim → bbox crop → component removal →
+  Taubin → simplify. Meshes ~1.2 M individually-noisy monocular-depth points, so
+  the surface is bumpy — kept only for comparison.
+- **Why TSDF wins:** the noise was per-view depth disagreement + grazing smear
+  baked into points; TSDF resolves it by weighted averaging in the SDF *before* a
+  surface exists, instead of fitting a surface through the noise.
+- **Output:** `output/fusion/mesh_fused.ply` + `mesh_fused_preview.png` (shaded
+  offscreen render). Read via `common.load_fused_mesh`; Phase E's input.
+- 🔭 Further levers if needed: integrate LiDAR depth into the TSDF too (metric
+  backbone on bare walls); smaller voxel (2 cm) for more detail; trim open-boundary
+  fringe; or per-pixel incidence-angle weighting to cut grazing-floor noise.
 
 ---
 
-## PHASE E — Multi-View Texture ⬜  (was "Step 5 colour")
+## PHASE E — Multi-View Texture ⬜  (was "Step 5 colour")  ← NEXT
 
-- Project mesh vertices into all 5 fisheye views; visibility checks (occlusion, angle,
-  distance, blur); weighted multi-view blend; bake to vertex colour or a UV texture atlas.
+- Inputs wired: `common.load_fused_mesh` (Phase D geometry) + `load_camera_manifest`
+  (5 fisheye cams with refined `pose`, `K`, `.read_image()`, `.confidence()`,
+  `.project()`). Same refined odom frame throughout.
+- Project mesh vertices into all 5 fisheye views; visibility checks (occlusion via
+  z-buffer / mesh raycast, incidence angle, distance, blur); weighted multi-view
+  blend; bake to vertex colour or a UV texture atlas.
+- Replaces Phase D's rough Poisson vertex colours (and fills the grey LiDAR-only
+  patches) with real image texture → the END-GOAL textured mesh.
 
 ---
 
@@ -261,16 +321,19 @@ plus OpenCV for undistort/projection.
 
 ## What runs end-to-end today
 
-`step1 → step3 → step4 → step6` → `mesh.ply` (LiDAR-only, coarse). Phases B/C/E are the
-image-fusion work that makes it actually look good.
+**LiDAR branch:** `step1 → step3 → step4 → step6` → `mesh.ply` (LiDAR-only, coarse).
+**Image branch:** `step0 → step_b1 → step_b2 → step_b3 → step_b4` → `image_cloud.npz`
+(dense colored cloud in the refined odom frame). **Phase C** (`step_c_fuse`) merges
+LiDAR + image → `fused_cloud` (1.27 M voxels); **Phase D** (`step_d_mesh`, TSDF) → `mesh_fused.ply`
+(614 k tris, flat walls + floor). Phase E (texture) is the remaining work to make it look good.
 
 ## Immediate next decisions
 
 1. **Depth method for Phase B2:** ✅ DECIDED — learned monocular metric depth + LiDAR
    anchor (Depth Anything V2 / Metric3D / UniDepth). Posed MVS dropped to fallback.
-2. ✅ DONE — **Step 0 camera prep**, **B1 image poses**, **B2 dense depth** (Depth
-   Anything V2 metric-indoor, 1060 maps), and **B3 LiDAR-anchored alignment**
-   (`step_b3_align.py`, held-out err 18 mm). Next is **B4** (back-project the
-   aligned depth → dense colored cloud), then **Phase C** fusion.
+2. ✅ DONE — image branch **B0–B4**, **Phase C fusion**, and **Phase D mesh**
+   (`step_d_mesh.py`, **TSDF** → `mesh_fused.ply`, 614 k tris, flat walls + floor;
+   Poisson kept as noisy baseline). Next is **Phase E**: project the 5 fisheye
+   cameras onto the mesh for real multi-view texture.
 3. **Capture a translating session, ideally with depth** — improves coverage for both
    branches and lets us validate B3 against real Spot depth.

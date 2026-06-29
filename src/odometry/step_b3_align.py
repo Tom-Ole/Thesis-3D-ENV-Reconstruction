@@ -199,6 +199,9 @@ def fit_image(uv, zp, zl, W, H, use_spline):
         "heldout_med_final_m": med_final,
         "use_spline": bool(spline),
         "fit_quality": quality,
+        # Range LiDAR actually validated; B4 tapers confidence beyond it so
+        # extrapolated far-depth hallucinations don't pollute the fused cloud.
+        "anchor_zmax": float(np.percentile(zl, 95)),
     }, grid
 
 

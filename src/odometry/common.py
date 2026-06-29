@@ -382,6 +382,7 @@ class Camera:
     align_b: float | None = None
     align_grid_path: str | None = None  # coarse disparity-residual grid (.npy)
     align_quality: float | None = None  # per-image fit_quality in [0, 1]
+    align_anchor_zmax: float | None = None  # range LiDAR validated (m); taper beyond
     depth_aligned_kind: str | None = None  # "metric_aligned_m"
 
     @property
@@ -454,22 +455,33 @@ class Camera:
                                interpolation=cv2.INTER_LINEAR)
         return np.where(D > 1e-6, 1.0 / D, np.nan).astype(np.float32)
 
-    def confidence(self, max_range: float = 12.0, edge_k: float = 0.5):
+    def confidence(self, max_range: float = 12.0, edge_k: float = 0.5,
+                   z: np.ndarray | None = None):
         """Per-pixel confidence in [0,1] for the aligned depth (B4 weighting).
 
         ``fit_quality`` (per-image, from B3) x an edge weight (low at depth
         discontinuities, where monocular depth is least reliable) x range
-        validity. None until B3 has run.
+        validity x an extrapolation taper that decays to 0 between
+        ``align_anchor_zmax`` and 1.5x it (depth past where LiDAR could check
+        it is untrustworthy). Pass ``z`` to reuse an already-loaded aligned
+        depth. None until B3 has run.
         """
-        z = self.read_depth_aligned()
+        if z is None:
+            z = self.read_depth_aligned()
         if z is None:
             return None
+        zc = np.nan_to_num(z, nan=max_range)
         valid = np.isfinite(z) & (z > 0.2) & (z < max_range)
-        logz = np.log(np.clip(np.nan_to_num(z, nan=max_range), 0.2, max_range))
+        logz = np.log(np.clip(zc, 0.2, max_range))
         gy, gx = np.gradient(logz)
         edge = np.exp(-np.hypot(gx, gy) / edge_k)
         q = self.align_quality if self.align_quality is not None else 1.0
-        return (valid * edge * q).astype(np.float32)
+        conf = valid * edge * q
+        if self.align_anchor_zmax:
+            zt = self.align_anchor_zmax
+            over = np.clip((zc - zt) / (0.5 * zt), 0.0, 1.0)  # 1@zt -> 0@1.5zt
+            conf = conf * (1.0 - over)
+        return conf.astype(np.float32)
 
     def project(self, pts_odom: np.ndarray):
         """Project Nx3 odom-frame points -> (uv Mx2, depth M, keep-mask N).
@@ -580,7 +592,54 @@ def _merge_align(root: str, cams: list):
         cam.align_b = float(a["b"])
         cam.align_grid_path = a.get("align_grid_path")
         cam.align_quality = float(a["fit_quality"])
+        cam.align_anchor_zmax = (float(a["anchor_zmax"])
+                                 if a.get("anchor_zmax") is not None else None)
         cam.depth_aligned_kind = kind
+
+def load_image_cloud(data_root: str):
+    """Load Step B4's dense image cloud -> (points, colors, normals, confidence).
+
+    Arrays are Nx3 / Nx3 / Nx3 / N, in the refined odom frame (same frame as the
+    LiDAR map). Raises if B4 has not been run.
+    """
+    root = os.path.abspath(data_root)
+    path = os.path.join(root, "output", "fusion", "image_cloud.npz")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No image cloud at {path}. Run step_b4_cloud.py first.")
+    d = np.load(path)
+    return d["points"], d["colors"], d["normals"], d["confidence"]
+
+
+def load_fused_cloud(data_root: str):
+    """Load Phase C's fused LiDAR+image cloud as an Open3D oriented point cloud.
+
+    Returns (pcd, attrs) where pcd has points/colors/normals and attrs carries
+    the per-point ``confidence`` and ``is_lidar`` arrays. In the refined odom
+    frame; ready for Phase D meshing.
+    """
+    root = os.path.abspath(data_root)
+    path = os.path.join(root, "output", "fusion", "fused_cloud.npz")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No fused cloud at {path}. Run step_c_fuse.py first.")
+    d = np.load(path)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(d["points"])
+    pcd.colors = o3d.utility.Vector3dVector(d["colors"])
+    pcd.normals = o3d.utility.Vector3dVector(d["normals"])
+    return pcd, {"confidence": d["confidence"], "is_lidar": d["is_lidar"]}
+
+
+def load_fused_mesh(data_root: str):
+    """Load Phase D's fused triangle mesh (geometry for Phase E texturing)."""
+    root = os.path.abspath(data_root)
+    path = os.path.join(root, "output", "fusion", "mesh_fused.ply")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No fused mesh at {path}. Run step_d_mesh.py first.")
+    return o3d.io.read_triangle_mesh(path)
+
 
 # Example:
 # import common

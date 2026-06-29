@@ -296,6 +296,28 @@ was too noisy.
   backbone on bare walls); smaller voxel (2 cm) for more detail; trim open-boundary
   fringe; or per-pixel incidence-angle weighting to cut grazing-floor noise.
 
+**TSDF** does not create a good enough mesh.
+Other option may be:
+- Ball Pivoting Algorithm (BPA)
+- Screened Poisson
+- CGAL Scale-Space / Advancing Front
+- Dual Contouring on an SDF
+  1. Voxelize point cloud into an SDF or TSDF.
+  2. Extract mesh with Dual Contouring instead of Marching Cubes.
+  3. Optional: simplify and remesh.
+AI Based options (Could be handled as AI refinement / Phase F):
+- NeuralPull
+- ConvONet
+
+Possible Pipeline:
+1. Clean the cloud (if not already done)
+  - Statistical outlier removal.
+  - Estimate normals consistently.
+2. Build a TSDF or SDF
+3. Extract with Dual Contouring
+4. AI refinement
+-- Run NeuralPull (or others) on regions with holes or noisy furniture.
+
 ---
 
 ## PHASE E — Multi-View Texture ⬜  (was "Step 5 colour")  ← NEXT

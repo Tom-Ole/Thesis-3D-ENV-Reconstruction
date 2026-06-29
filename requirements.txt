@@ -1,6 +1,9 @@
 # Install PyTorch for your system. (>2.12)
 # https://pytorch.org/get-started/locally/
 
+# Transformers
+Transformers>=5.12.1
+
 # GUI framework (the app is built on Qt for Python / PySide6).
 PySide6>=6.6
 

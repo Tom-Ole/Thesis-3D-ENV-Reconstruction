@@ -309,7 +309,7 @@ def main():
     # Physically rotate legacy upside-down pixels (e.g. 'right' captured before
     # the capture code was fixed). The intrinsics are reconciled either way;
     # only set this True for old sessions whose images are still upside down.
-    rotate_legacy_pixels = False
+    rotate_legacy_pixels = True
 
     run(data_root, undistort=undistort, dist_coeffs=dist_coeffs,
         overlay=overlay, rotate_legacy_pixels=rotate_legacy_pixels, limit=limit)

@@ -349,6 +349,13 @@ class Camera:
     (rotation/undistortion already reconciled), and ``odom_T_camera`` is in the
     same odom frame as the LiDAR clouds (Frame.read_cloud()). So projecting a
     LiDAR point is just ``K @ (cam_T_odom @ X_odom)``.
+
+    Step B1 (step_b1_image_poses.py) optionally fills the ``*_refined`` /
+    ``lidar_*`` fields: a pose made drift-consistent with the LiDAR SLAM
+    trajectory and the time-nearest LiDAR scan to use as the B3 metric anchor.
+    When present, ``.pose`` (and therefore ``.cam_T_odom`` / ``.project``)
+    transparently uses the refined pose; otherwise it falls back to Step 0's raw
+    Spot-odometry pose. Downstream code never has to branch on whether B1 ran.
     """
     source: str
     camera: str
@@ -357,10 +364,25 @@ class Camera:
     width: int
     height: int
     K: np.ndarray               # 3x3
-    odom_T_camera: np.ndarray   # 4x4
+    odom_T_camera: np.ndarray   # 4x4 (raw Spot per-image odometry, from Step 0)
     distortion_mode: str
     mask_path: str | None
     source_image: str
+    # --- Step B1 enrichment (None until step_b1_image_poses.py has run) ------
+    odom_T_camera_refined: np.ndarray | None = None  # 4x4, LiDAR-SLAM consistent
+    lidar_index: int | None = None      # nearest LiDAR scan (SessionDataset idx)
+    lidar_t_nsec: int | None = None     # that scan's timestamp
+    dt_sec: float | None = None         # |image - scan| time gap (seconds)
+    pose_source: str | None = None      # "interpolated" | "clamped"
+    # --- Step B2 enrichment (None until step_b2_depth.py has run) ------------
+    depth_path: str | None = None       # per-pixel depth map (.npy) on disk
+    depth_kind: str | None = None       # "metric_m" | "inverse_relative"
+    # --- Step B3 enrichment (None until step_b3_align.py has run) ------------
+    align_a: float | None = None        # disparity affine: 1/z_lidar ~ a/z + b
+    align_b: float | None = None
+    align_grid_path: str | None = None  # coarse disparity-residual grid (.npy)
+    align_quality: float | None = None  # per-image fit_quality in [0, 1]
+    depth_aligned_kind: str | None = None  # "metric_aligned_m"
 
     @property
     def t_sec(self) -> float:
@@ -371,9 +393,24 @@ class Camera:
         return (self.width, self.height)
 
     @property
+    def pose(self) -> np.ndarray:
+        """Best available odom->camera pose: B1-refined if present, else raw."""
+        return (self.odom_T_camera_refined if self.odom_T_camera_refined
+                is not None else self.odom_T_camera)
+
+    @property
     def cam_T_odom(self) -> np.ndarray:
         """World(odom)->camera transform, ready for projection."""
-        return np.linalg.inv(self.odom_T_camera)
+        return np.linalg.inv(self.pose)
+
+    def anchor_scan(self, dataset: "SessionDataset"):
+        """The time-nearest LiDAR Frame chosen by B1 (the B3 anchor scan).
+
+        Returns None until step_b1_image_poses.py has populated ``lidar_index``.
+        """
+        if self.lidar_index is None:
+            return None
+        return dataset.frames[self.lidar_index]
 
     def read_image(self) -> np.ndarray:
         """The prepared BGR image (upright, matching self.K)."""
@@ -386,6 +423,53 @@ class Camera:
             return None
         import cv2
         return cv2.imread(self.mask_path, cv2.IMREAD_GRAYSCALE)
+
+    def read_depth(self):
+        """B2's dense depth map as float32 (H,W), or None until B2 has run.
+
+        Units follow ``depth_kind``: "metric_m" is metres (pre-B3, so scale is
+        only approximate); "inverse_relative" is disparity-like (larger=closer).
+        """
+        if not self.depth_path:
+            return None
+        return np.load(self.depth_path).astype(np.float32)
+
+    def read_depth_aligned(self):
+        """B3 LiDAR-anchored metric depth (H,W) m, or None until B3 has run.
+
+        Applies the disparity affine (and smoothed residual grid, if B3 kept
+        one) to ``read_depth()`` on the fly: ``z = 1/(a/z_pred + b + grid)``.
+        Pixels where the corrected disparity is non-positive are NaN.
+        """
+        if self.align_a is None:
+            return None
+        z = self.read_depth()
+        if z is None:
+            return None
+        D = self.align_a / np.clip(z, 1e-6, None) + self.align_b
+        if self.align_grid_path:
+            import cv2
+            g = np.load(self.align_grid_path).astype(np.float32)
+            D = D + cv2.resize(g, (z.shape[1], z.shape[0]),
+                               interpolation=cv2.INTER_LINEAR)
+        return np.where(D > 1e-6, 1.0 / D, np.nan).astype(np.float32)
+
+    def confidence(self, max_range: float = 12.0, edge_k: float = 0.5):
+        """Per-pixel confidence in [0,1] for the aligned depth (B4 weighting).
+
+        ``fit_quality`` (per-image, from B3) x an edge weight (low at depth
+        discontinuities, where monocular depth is least reliable) x range
+        validity. None until B3 has run.
+        """
+        z = self.read_depth_aligned()
+        if z is None:
+            return None
+        valid = np.isfinite(z) & (z > 0.2) & (z < max_range)
+        logz = np.log(np.clip(np.nan_to_num(z, nan=max_range), 0.2, max_range))
+        gy, gx = np.gradient(logz)
+        edge = np.exp(-np.hypot(gx, gy) / edge_k)
+        q = self.align_quality if self.align_quality is not None else 1.0
+        return (valid * edge * q).astype(np.float32)
 
     def project(self, pts_odom: np.ndarray):
         """Project Nx3 odom-frame points -> (uv Mx2, depth M, keep-mask N).
@@ -405,7 +489,13 @@ class Camera:
 
 
 def load_camera_manifest(data_root: str):
-    """Load Step 0's output/cameras/manifest.json as a list of Camera records."""
+    """Load Step 0's output/cameras/manifest.json as a list of Camera records.
+
+    If Step B1 has written output/cameras/poses_b1.json, each camera is enriched
+    in place with the refined pose + nearest-LiDAR-scan fields (matched by
+    ``source_image``), so ``.pose`` / ``.project()`` use the drift-consistent
+    pose automatically.
+    """
     root = os.path.abspath(data_root)
     path = os.path.join(root, "output", "cameras", "manifest.json")
     if not os.path.isfile(path):
@@ -429,7 +519,68 @@ def load_camera_manifest(data_root: str):
             mask_path=c.get("mask_path"),
             source_image=c.get("source_image", c["image_path"]),
         ))
+
+    _merge_image_poses(root, cams)
+    _merge_depth(root, cams)
+    _merge_align(root, cams)
     return cams
+
+
+def _merge_image_poses(root: str, cams: list):
+    """Fold Step B1's poses_b1.json (if present) into the Camera records."""
+    path = os.path.join(root, "output", "cameras", "poses_b1.json")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        poses = json.load(f)
+    by_src = {p["source_image"]: p for p in poses.get("cameras", [])}
+    for cam in cams:
+        p = by_src.get(cam.source_image)
+        if p is None:
+            continue
+        cam.odom_T_camera_refined = np.array(
+            p["odom_T_camera_refined"], dtype=float)
+        cam.lidar_index = int(p["lidar_index"])
+        cam.lidar_t_nsec = int(p["lidar_t_nsec"])
+        cam.dt_sec = float(p["dt_sec"])
+        cam.pose_source = p.get("pose_source")
+
+
+def _merge_depth(root: str, cams: list):
+    """Fold Step B2's depth_b2.json (if present) into the Camera records."""
+    path = os.path.join(root, "output", "depth", "depth_b2.json")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        depth = json.load(f)
+    kind = depth.get("depth_kind")
+    by_src = {d["source_image"]: d for d in depth.get("images", [])}
+    for cam in cams:
+        d = by_src.get(cam.source_image)
+        if d is None:
+            continue
+        cam.depth_path = d["depth_path"]
+        cam.depth_kind = kind
+
+
+def _merge_align(root: str, cams: list):
+    """Fold Step B3's align_b3.json (if present) into the Camera records."""
+    path = os.path.join(root, "output", "depth", "align_b3.json")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        align = json.load(f)
+    kind = align.get("depth_aligned_kind")
+    by_src = {a["source_image"]: a for a in align.get("images", [])}
+    for cam in cams:
+        a = by_src.get(cam.source_image)
+        if a is None:
+            continue
+        cam.align_a = float(a["a"])
+        cam.align_b = float(a["b"])
+        cam.align_grid_path = a.get("align_grid_path")
+        cam.align_quality = float(a["fit_quality"])
+        cam.depth_aligned_kind = kind
 
 # Example:
 # import common

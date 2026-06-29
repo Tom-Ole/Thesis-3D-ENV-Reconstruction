@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 CAMERA_ROTATION = {
     "back_fisheye_image": None,
     "left_fisheye_image": None,
-    "right_fisheye_image": None,
+    "right_fisheye_image": cv2.ROTATE_180,
     "frontleft_fisheye_image": cv2.ROTATE_90_CLOCKWISE,
     "frontright_fisheye_image": cv2.ROTATE_90_CLOCKWISE,
     "frontleft_depth": cv2.ROTATE_90_CLOCKWISE,
@@ -33,13 +33,14 @@ CAMERA_ROTATION = {
     "back_depth_in_visual_frame": None,
     "left_depth": None,
     "left_depth_in_visual_frame": None,
-    "right_depth": None,
-    "right_depth_in_visual_frame": None,
+    "right_depth": cv2.ROTATE_180,
+    "right_depth_in_visual_frame": cv2.ROTATE_180,
 }
 
 _ROTATION_NAMES = {
     cv2.ROTATE_90_CLOCKWISE: "ROTATE_90_CLOCKWISE",
     cv2.ROTATE_90_COUNTERCLOCKWISE: "ROTATE_90_COUNTERCLOCKWISE",
+    cv2.ROTATE_180: "ROTATE_180",
 }
 
 
@@ -193,6 +194,7 @@ def _intrinsics_dict(intrinsics) -> dict:
     }
 
 
+# TODO: Add fisheye
 def _extract_camera_model(source) -> dict:
     """Pull the camera model (intrinsics + distortion) from an ImageSource."""
     try:

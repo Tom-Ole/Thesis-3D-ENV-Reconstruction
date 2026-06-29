@@ -56,6 +56,98 @@ def _edge_matrix(edge: dict) -> np.ndarray:
                           _xyzw(p.get("rotation", {})))
 
 
+def body_T_frame(edges: dict, frame: str) -> np.ndarray:
+    """
+    Compose body_T_frame by walking a transforms_snapshot up to 'body'.
+
+    Each edge stores parent_tform_child + the parent's name, so we accumulate
+    body_T_child = body_T_parent @ parent_tform_child along the chain. Used to
+    place any sensor frame (e.g. 'frontleft_fisheye') in the common body frame.
+    """
+    T = np.eye(4)
+    cur = frame
+    seen = set()
+    while cur in edges and cur != "body" and cur not in seen:
+        seen.add(cur)
+        T = _edge_matrix(edges[cur]) @ T
+        cur = edges[cur].get("parent_frame_name", "body")
+    return T
+
+
+def odom_T_frame(edges: dict, frame: str) -> np.ndarray:
+    """frame's pose in the (fixed) odom frame, composed from one snapshot."""
+    body_T_odom = _edge_matrix(edges["odom"])      # odom's parent is body
+    return np.linalg.inv(body_T_odom) @ body_T_frame(edges, frame)
+
+
+# --- Camera intrinsics ------------------------------------------------------
+
+def intrinsics_matrix(camera_model: dict) -> np.ndarray:
+    """Bosdyn pinhole camera_model -> 3x3 intrinsics K (raw sensor frame)."""
+    intr = camera_model["intrinsics"]
+    fx = intr["focal_length"]["x"]
+    fy = intr["focal_length"]["y"]
+    cx = intr["principal_point"]["x"]
+    cy = intr["principal_point"]["y"]
+    skew = intr.get("skew", {}).get("x", 0.0)
+    return np.array([[fx, skew, cx],
+                     [0.0, fy,  cy],
+                     [0.0, 0.0, 1.0]])
+
+
+# A 90deg-clockwise IMAGE rotation corresponds to a +90deg rotation of the
+# camera optical frame about its own optical (z) axis. Keeping image *and*
+# intrinsics *and* extrinsics consistent means applying this same rotation to
+# the optical-frame pose (see rotate_intrinsics_90cw / Step 0).
+ROT_Z_90 = np.array([[0.0, -1.0, 0.0, 0.0],
+                     [1.0,  0.0, 0.0, 0.0],
+                     [0.0,  0.0, 1.0, 0.0],
+                     [0.0,  0.0, 0.0, 1.0]])
+
+# 180deg image rotation == 180deg about the optical (z) axis (self-inverse).
+ROT_Z_180 = np.array([[-1.0,  0.0, 0.0, 0.0],
+                      [0.0,  -1.0, 0.0, 0.0],
+                      [0.0,   0.0, 1.0, 0.0],
+                      [0.0,   0.0, 0.0, 1.0]])
+
+
+def rotate_intrinsics_90cw(K: np.ndarray, w0: int, h0: int):
+    """
+    Map raw intrinsics onto an image that was rotated 90deg CLOCKWISE.
+
+    Spot stores frontleft/frontright already rotated upright (w0xh0 sensor ->
+    h0xw0 image) but leaves the intrinsics describing the raw sensor. For a CW
+    rotation a raw pixel (u,v) lands at (u',v') = ((h0-1)-v, u); solving for the
+    intrinsics that reproduce that (with the optical frame turned by ROT_Z_90)
+    gives a clean upper-triangular K':
+
+        fx' = fy,  fy' = fx,  cx' = (h0-1) - cy,  cy' = cx
+
+    Returns (K_rot, (w_rot, h_rot)) with the rotated image size.
+    """
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    K_rot = np.array([[fy,  0.0, (h0 - 1) - cy],
+                      [0.0, fx,  cx],
+                      [0.0, 0.0, 1.0]])
+    return K_rot, (h0, w0)
+
+
+def rotate_intrinsics_180(K: np.ndarray, w: int, h: int):
+    """Map intrinsics onto a 180deg-rotated image (size unchanged).
+
+    A 180deg rotation sends pixel (u,v) -> (w-1-u, h-1-v); the focal lengths are
+    unchanged and the principal point mirrors through the centre (paired with a
+    ROT_Z_180 turn of the optical frame). Returns (K_rot, (w, h)).
+    """
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    K_rot = np.array([[fx,  0.0, (w - 1) - cx],
+                      [0.0, fy,  (h - 1) - cy],
+                      [0.0, 0.0, 1.0]])
+    return K_rot, (w, h)
+
+
 # --- Dataset ----------------------------------------------------------------
 
 @dataclass
@@ -164,6 +256,192 @@ class SessionDataset:
 
     def __getitem__(self, i):
         return self.frames[i]
+
+
+# --- Camera images ----------------------------------------------------------
+
+# The five RGB fisheye sources, by the suffix used in their filenames.
+CAMERA_SOURCES = ("back", "frontleft", "frontright", "left", "right")
+
+
+@dataclass
+class ImageFrame:
+    """One RGB image plus its intrinsics, pose and rotation bookkeeping.
+
+    Reads as stored on disk: front cameras are already rotated upright, the rest
+    are landscape. ``rotation_applied`` records what the capture did so Step 0
+    can reconcile the intrinsics (see common.rotate_intrinsics_90cw).
+    """
+    index: int
+    image_path: str
+    meta_path: str
+    t_nsec: int
+    source: str                  # e.g. "frontleft_fisheye_image"
+    sensor_frame: str            # e.g. "frontleft_fisheye"
+    rotation_applied: str | None  # e.g. "ROTATE_90_CLOCKWISE" or None
+    K_raw: np.ndarray            # 3x3, describes the RAW (unrotated) sensor
+    raw_size: tuple              # (w0, h0) of the raw sensor (cols, rows)
+    odom_T_sensor: np.ndarray    # raw optical-frame pose in odom (4x4)
+
+    @property
+    def t_sec(self) -> float:
+        return self.t_nsec * 1e-9
+
+    @property
+    def camera_name(self) -> str:
+        """Short name ('frontleft', 'back', ...) from the source string."""
+        return self.source.replace("_fisheye_image", "")
+
+    def read_image(self) -> np.ndarray:
+        """BGR image as stored on disk (already upright for front cameras)."""
+        import cv2
+        return cv2.imread(self.image_path, cv2.IMREAD_COLOR)
+
+
+def load_image_frames(data_root: str):
+    """All RGB image frames for a session, sorted by filename, with poses."""
+    root = os.path.abspath(data_root)
+    images_dir = os.path.join(root, "images")
+    metadata_dir = os.path.join(root, "metadata")
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"No 'images' folder at {images_dir}")
+
+    frames = []
+    for img in sorted(glob.glob(os.path.join(images_dir, "*.jpg")),
+                      key=_natural_key):
+        stem = os.path.splitext(os.path.basename(img))[0]
+        meta_path = os.path.join(metadata_dir, stem + ".json")
+        if not os.path.isfile(meta_path):
+            continue
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get("capture_type") != "image":
+            continue
+
+        edges = (meta.get("transforms_snapshot", {})
+                     .get("child_to_parent_edge_map", {}))
+        sensor_frame = meta.get("frame_name_image_sensor", "")
+        odom_T_sensor = (odom_T_frame(edges, sensor_frame)
+                         if sensor_frame in edges else np.eye(4))
+
+        frames.append(ImageFrame(
+            index=meta.get("index", len(frames) + 1),
+            image_path=img,
+            meta_path=meta_path,
+            t_nsec=int(meta.get("acquisition_time_robot_nsec", 0)),
+            source=meta.get("source", stem),
+            sensor_frame=sensor_frame,
+            rotation_applied=meta.get("rotation_applied"),
+            K_raw=intrinsics_matrix(meta["camera_model"]),
+            raw_size=(int(meta.get("cols", 0)), int(meta.get("rows", 0))),
+            odom_T_sensor=odom_T_sensor,
+        ))
+    return frames
+
+
+# --- Prepared cameras (Step 0 manifest, read side) --------------------------
+
+@dataclass
+class Camera:
+    """A prepared camera from Step 0's manifest, with arrays already parsed.
+
+    The contract guaranteed by Step 0: ``image_path`` and ``K`` always match
+    (rotation/undistortion already reconciled), and ``odom_T_camera`` is in the
+    same odom frame as the LiDAR clouds (Frame.read_cloud()). So projecting a
+    LiDAR point is just ``K @ (cam_T_odom @ X_odom)``.
+    """
+    source: str
+    camera: str
+    t_nsec: int
+    image_path: str
+    width: int
+    height: int
+    K: np.ndarray               # 3x3
+    odom_T_camera: np.ndarray   # 4x4
+    distortion_mode: str
+    mask_path: str | None
+    source_image: str
+
+    @property
+    def t_sec(self) -> float:
+        return self.t_nsec * 1e-9
+
+    @property
+    def size(self) -> tuple:
+        return (self.width, self.height)
+
+    @property
+    def cam_T_odom(self) -> np.ndarray:
+        """World(odom)->camera transform, ready for projection."""
+        return np.linalg.inv(self.odom_T_camera)
+
+    def read_image(self) -> np.ndarray:
+        """The prepared BGR image (upright, matching self.K)."""
+        import cv2
+        return cv2.imread(self.image_path, cv2.IMREAD_COLOR)
+
+    def read_mask(self):
+        """Valid-pixel mask if undistortion produced one, else None."""
+        if not self.mask_path:
+            return None
+        import cv2
+        return cv2.imread(self.mask_path, cv2.IMREAD_GRAYSCALE)
+
+    def project(self, pts_odom: np.ndarray):
+        """Project Nx3 odom-frame points -> (uv Mx2, depth M, keep-mask N).
+
+        Keeps only points in front of the camera and inside the image; ``keep``
+        indexes back into the input rows so callers can carry colour/labels.
+        """
+        pts = np.asarray(pts_odom, dtype=float).reshape(-1, 3)
+        cam = (self.cam_T_odom @ np.hstack(
+            [pts, np.ones((len(pts), 1))]).T).T[:, :3]
+        z = cam[:, 2]
+        uv = (self.K @ cam.T).T
+        uv = uv[:, :2] / uv[:, 2:3]
+        keep = (z > 1e-6) & (uv[:, 0] >= 0) & (uv[:, 0] < self.width) \
+            & (uv[:, 1] >= 0) & (uv[:, 1] < self.height)
+        return uv[keep], z[keep], keep
+
+
+def load_camera_manifest(data_root: str):
+    """Load Step 0's output/cameras/manifest.json as a list of Camera records."""
+    root = os.path.abspath(data_root)
+    path = os.path.join(root, "output", "cameras", "manifest.json")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No camera manifest at {path}. Run step0_camera_prep.py first.")
+    with open(path) as f:
+        manifest = json.load(f)
+
+    cams = []
+    for c in manifest.get("cameras", []):
+        cams.append(Camera(
+            source=c["source"],
+            camera=c["camera"],
+            t_nsec=int(c["t_nsec"]),
+            image_path=c["image_path"],
+            width=int(c["width"]),
+            height=int(c["height"]),
+            K=np.array(c["K"], dtype=float),
+            odom_T_camera=np.array(c["odom_T_camera"], dtype=float),
+            distortion_mode=c.get("distortion_mode", "none"),
+            mask_path=c.get("mask_path"),
+            source_image=c.get("source_image", c["image_path"]),
+        ))
+    return cams
+
+# Example:
+# import common
+
+# cams = common.load_camera_manifest("./captures/session_05_20260624")
+# lidar = common.SessionDataset("./captures/session_05_20260624")
+
+# for cam in cams:
+#     img = cam.read_image()                         # upright BGR, matches cam.K
+#     lf  = min(lidar.frames, key=lambda f: abs(f.t_nsec - cam.t_nsec))  # B3 sync
+#     uv, depth, keep = cam.project(lf.read_cloud().points)  # sparse metric anchor
+#     # B2: run depth model on img; B3: fit predicted depth to `depth` at `uv`
 
 
 # --- Visualization helpers --------------------------------------------------

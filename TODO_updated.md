@@ -132,12 +132,23 @@ Depends on **Step 0 calibration** (below). Uses the known LiDAR poses, so no SfM
 - **Validated:** LiDAR-reprojection overlay (`output/cameras/debug/`) shows rings
   hugging the walls and bending around a box — extrinsics/intrinsics confirmed,
   and confirms undistortion is unnecessary for now.
-- Output: `output/cameras/manifest.json` (per image: upright image path, K,
-  size, `odom_T_camera`, `distortion_mode`, mask).
+- Output: `output/cameras/manifest.json` (per image: upright `image_path`, `K`,
+  size, `odom_T_camera`, `t_nsec`, `distortion_mode`, `mask_path`). **This is the
+  single contract for the whole image branch** — downstream steps read the
+  manifest, never `captures/images/` directly. `image_path` + `K` are always
+  mutually consistent, and `odom_T_camera` shares the odom frame with the LiDAR
+  clouds. (Note: paths are absolute — re-run Step 0 if the repo moves.)
+- **Read API in `common.py`:** `load_camera_manifest(data_root) -> list[Camera]`
+  with arrays parsed. `Camera` exposes `.read_image()`, `.read_mask()`,
+  `.cam_T_odom`, `.size`, `.t_sec`, and
+  `.project(pts_odom) -> (uv, depth, keep)` (drops behind-camera/out-of-frame;
+  `keep` indexes back into the input). `.project()` is the B3 anchor primitive.
 
-### B1 — Pose & prep each image ⬜
-- Compose `odom_T_camera` per image from metadata; undistort/rotate to a clean pinhole image.
-- Sync each image to the nearest LiDAR scan / interpolate pose on robot-clock nsec.
+### B1 — Pose & prep each image 🟡 (mostly covered by B0 manifest)
+- ✅ `odom_T_camera` + clean upright pinhole image are already in the manifest
+  (load via `common.load_camera_manifest`). No per-image metadata work left.
+- ⬜ Remaining: sync each image to the nearest LiDAR scan / interpolate pose on
+  robot-clock `t_nsec` (helper: `min(lidar.frames, key=|f.t_nsec - cam.t_nsec|)`).
 
 ### B2 — Dense depth per image ⬜
 **✅ CHOSEN: Learned monocular metric depth + LiDAR anchor.**
@@ -149,7 +160,8 @@ Depends on **Step 0 calibration** (below). Uses the known LiDAR poses, so no SfM
   indoor; kept only as a fallback reference.
 
 ### B3 — LiDAR-anchored metric alignment ⬜  ← the fusion glue
-- Project LiDAR points into each image → sparse metric depth samples.
+- Project LiDAR points into each image → sparse metric depth samples
+  (use `Camera.project()`; returns `uv` + metric `depth` per sample).
 - Fit predicted depth to LiDAR (global scale+shift, then optional per-pixel/spline
   correction). This makes image depth metric and drift-consistent with LiDAR.
 

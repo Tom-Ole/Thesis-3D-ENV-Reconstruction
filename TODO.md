@@ -87,6 +87,7 @@ rotation + optional/skippable fisheye → camera manifest), `step1_odometry.py`,
 (LiDAR-only baseline mesh), `step_b1_image_poses.py` (image branch: sync + refine
 camera poses), `step_b2_depth.py` (dense monocular metric depth per image),
 `step_b3_align.py` (LiDAR-anchored metric alignment of that depth),
+`step_b3b_consistency.py` (multi-view consistency filtering → per-frame weight),
 `step_b4_cloud.py` (back-project → dense colored image cloud),
 `step_c_fuse.py` (LiDAR × image geometry fusion → `fused_cloud`),
 `step_d_mesh.py` (TSDF/Poisson mesh → `mesh_fused.ply`; TSDF default = clean).
@@ -213,6 +214,26 @@ Depends on **Step 0 calibration** (below). Uses the known LiDAR poses, so no SfM
   affine+grid on the fly) and `.confidence()`; merged transparently by
   `common.load_camera_manifest`. Checks in `output/depth/debug/<stem>_align.jpg`.
 
+### B3b — Multi-view consistency filtering ✅ (`step_b3b_consistency.py`)  ← fixes blobby objects
+- **The in-environment fix for noisy/blobby objects** (no gsplat / no CUDA build —
+  pure torch/numpy, runs on torch 2.12+cu132). Classical MVS geometric
+  consistency applied to the B3 aligned depth: back-project each ref pixel,
+  reproject into covisible neighbours (selected by optical-axis similarity), and
+  check depth agreement (TAU=5%).
+- **Key subtlety — `seen` vs `agree`:** only *judge* a pixel when ≥`MIN_SEEN`(3)
+  neighbours actually saw it; cull only confirmed-inconsistent pixels (the object
+  blobs, seen by many, disagreeing). Pixels too few neighbours could check (the
+  grazing floor strips that barely overlap across the spin) are **unverifiable →
+  kept**. This was essential: a naïve count-only gate culled the whole floor.
+- **Output:** `output/depth/consistency/<stem>.npy` (uint8 weight) +
+  `consistency.json`. `Camera.confidence()` multiplies it in, so the existing
+  confidence-gated TSDF (Phase D) automatically meshes only consistent geometry.
+  Median 67% of valid depth kept; ~27–95 s.
+- **Result:** objects (table, box) become distinct structures instead of blobs,
+  walls cleaner, **floor preserved** — see Phase D. Still bounded by the monocular
+  + low-parallax ceiling (not photoreal); learned-MV (VGGT/DUSt3R, also build-free)
+  or better capture remain the further levers.
+
 ### B4 — Back-project to dense image cloud ✅ (`step_b4_cloud.py`)
 - Unproject each image's B3 aligned depth → refined odom frame
   (`X_odom = pose · z·K⁻¹·[u,v,1]`), same frame as the LiDAR map.
@@ -275,14 +296,17 @@ Two paths in `step_d_mesh.py`; **TSDF is the default** because Poisson-on-points
 was too noisy.
 
 - **TSDF + Marching Cubes (DEFAULT, the clean mesh).** Volumetrically integrate
-  the B3 aligned depth maps into a truncated SDF (`ScalableTSDFVolume`, voxel
-  3 cm, trunc 12 cm), confidence-gated per pixel (drop conf < 0.45) and per frame
-  (skip B3 `fit_quality` < 0.35), then Marching Cubes. Each surface voxel
-  averages many overlapping observations → **flat walls, watertight-ish, RGB
-  baked in**. Cleanup: small-component removal + Taubin (8). Result: **614 k tris,
-  321 k verts, coloured, in ~20 s**, 834/1060 frames integrated. Walls are flat
-  (vs Poisson's "tinfoil"); residual feathery fringe only at open room boundaries
-  + grazing-angle floor.
+  the B3 aligned depth maps into a truncated SDF (`ScalableTSDFVolume`), now
+  **gated by B3b multi-view consistency** via `Camera.confidence()` (consistency
+  is the primary gate, so CONF_THR dropped to 0.12 and voxel to **2 cm / trunc
+  6 cm** for crisper objects), + per-frame quality gate (skip `fit_quality`
+  < 0.35), then Marching Cubes. Cleanup: small-component removal + Taubin (5).
+  Result: **~918 k tris, 484 k verts, coloured, in ~25 s**, 943/1060 frames.
+  **Objects (table/box) are now distinct, walls clean, floor preserved**
+  (z-min −0.63). Big step up from the pre-consistency blobby TSDF.
+- ⚠️ Still bounded by the monocular + ≈1.6 m-spin ceiling: residual edge fringe
+  + not photoreal. Further (build-free) levers: learned multi-view (VGGT/DUSt3R)
+  or a translating/orbit recapture.
 - **Poisson (baseline, `method="poisson"`).** Poisson on Phase C's `fused_cloud`
   (reuses `step6`): depth 10 → density trim → bbox crop → component removal →
   Taubin → simplify. Meshes ~1.2 M individually-noisy monocular-depth points, so
@@ -296,27 +320,62 @@ was too noisy.
   backbone on bare walls); smaller voxel (2 cm) for more detail; trim open-boundary
   fringe; or per-pixel incidence-angle weighting to cut grazing-floor noise.
 
-**TSDF** does not create a good enough mesh.
-Other option may be:
-- Ball Pivoting Algorithm (BPA)
-- Screened Poisson
-- CGAL Scale-Space / Advancing Front
-- Dual Contouring on an SDF
-  1. Voxelize point cloud into an SDF or TSDF.
-  2. Extract mesh with Dual Contouring instead of Marching Cubes.
-  3. Optional: simplify and remesh.
-AI Based options (Could be handled as AI refinement / Phase F):
-- NeuralPull
-- ConvONet
+### ⚠️ DIAGNOSIS — the mesher is NOT the bottleneck (objects stay noisy/blobby)
 
-Possible Pipeline:
-1. Clean the cloud (if not already done)
-  - Statistical outlier removal.
-  - Estimate normals consistently.
-2. Build a TSDF or SDF
-3. Extract with Dual Contouring
-4. AI refinement
--- Run NeuralPull (or others) on regions with holes or noisy furniture.
+Goal is sharp, realistic OBJECTS (table, box), not just flat walls. Tested and
+grounded:
+- **Single-frame B2 depth is crisp** (box/monitor edges are clean), but
+  **monocular depth is not multi-view consistent** — each frame guesses an
+  object's 3D shape slightly differently.
+- Fusion must then either **average** those disagreements (coarse TSDF 3 cm/12 cm
+  → blobby, rounded objects) or **preserve** them (fine TSDF 1.5 cm/4 cm →
+  sharper but noisy/fragmented). Verified both — you cannot get sharp **and**
+  clean from this data by tuning the mesher.
+- **TSDF, Poisson, BPA, Dual Contouring all average the same inconsistent
+  inputs** → none fixes it. BPA/Advancing-Front are *interpolating* → reproduce
+  noise (worse). Screened Poisson == our `method="poisson"` baseline already.
+  Dual Contouring helps sharp corners we don't lack, and amplifies noise on a
+  noisy SDF. So the meshing-algorithm menu is a dead end for this symptom.
+
+**Root cause:** multi-view-inconsistent monocular depth + the near-stationary
+spin (≈1.6 m footprint → almost no parallax, can't see object sides/backs).
+
+### Real paths to sharp/realistic objects (ranked)
+1. **Phase F neural with multi-view photometric consistency** — 2D Gaussian
+   Splatting → mesh, or SuGaR. Fits ONE geometry to all RGB views, so edges that
+   mono-depth averaging destroys come back. Use the LiDAR mesh/cloud as
+   prior+regularizer for the low parallax. **This is the in-data answer.**
+   (Raw 3DGS novel-view renders look more photoreal than any extracted mesh — use
+   that if the deliverable can be renders rather than a strict mesh.)
+2. **Sharper depth model in B2 — DepthPro** (metric, sharp boundaries, drop-in via
+   the pluggable `DepthBackend`). Cheap; sharpens per-frame edges, but it's still
+   monocular → still multi-view-inconsistent → objects improve but stay soft.
+3. **Better capture (the true fix):** orbit/translate around objects + enable Spot
+   depth. A spin-in-place fundamentally can't do realistic furniture; no
+   algorithm fully overcomes it.
+
+**RESOLVED (in-environment, no gsplat):** multi-view consistency filtering
+(`step_b3b_consistency.py`, B3b) + consistency-gated finer TSDF → objects become
+distinct, floor preserved. This is the working fix given the fixed torch
+2.12/cu132 env. 2DGS remains blocked (below) and is optional upside, not required.
+
+**Status of (c):**
+- ✅ **DepthPro done** (B2 now defaults to `apple/DepthPro-hf` via `HFDepthBackend`;
+  DA-V2 still selectable). Metric scale much better (x0.78 vs DA-V2 x0.51), B3
+  held-out 17 mm, walls a bit cleaner — but **furniture/floor still noisy/blobby**.
+  Confirms the ceiling: a sharper *monocular* model doesn't fix multi-view
+  inconsistency. (DA-V2 mesh snapshot kept at `mesh_fused_dav2.ply`.)
+- ⛔ **2DGS BLOCKED on environment.** gsplat 1.5.3 (latest) won't build its CUDA
+  kernels against **torch 2.12.1+cu132** on Windows: (1) it calls torch-internal
+  `_jit_compile` with an outdated signature (torch 2.12 added `with_sycl`/
+  `extra_sycl_cflags`), (2) it passes `/Wno-attributes` to MSVC `cl.exe`. nvcc
+  12.8 *does* target Blackwell sm_120 fine; the problem is torch 2.12 is too new
+  for gsplat. Blackwell forced us onto new torch, which gsplat hasn't caught up to.
+  **To unblock:** a dedicated venv with torch ~2.7/2.8 **+cu128** (supports sm_120
+  AND is gsplat-compatible) + ninja + the installed VS2022 MSVC. Then build the
+  actual 2DGS train + mesh-extraction pipeline (substantial). Even then, the
+  ≈1.6 m spin is parallax-starved — the LiDAR-mesh prior is essential, and a
+  translating/orbit capture remains the bigger lever.
 
 ---
 
@@ -333,21 +392,27 @@ Possible Pipeline:
 
 ---
 
-## PHASE F — Neural Refinement (optional, advanced) ⬜
+## PHASE F — Neural Refinement (the real path to sharp objects) ⬜
 
-- 2D Gaussian Splatting / SuGaR on the 5-camera images with Step 3 poses; extract mesh;
-  use the Phase D fused mesh as geometric prior/regularizer (prevents collapse on
-  low-parallax motion). Output: refined textured mesh.
+- 2D Gaussian Splatting / SuGaR on the 5-camera images with the refined poses;
+  extract mesh; use the Phase D fused mesh as geometric prior/regularizer
+  (prevents collapse on low-parallax motion). Output: refined textured mesh.
+- ⛔ **Env blocker (see Phase D diagnosis):** gsplat 1.5.3 ✗ torch 2.12+cu132 on
+  Windows. Needs a dedicated **torch 2.7/2.8 +cu128** venv (sm_120 + gsplat-
+  compatible) + ninja + VS2022 MSVC (installed). Bounded setup, then a real
+  train/extract pipeline.
+- Note: raw 3DGS novel-view renders look more photoreal than any extracted mesh —
+  use that if the deliverable can be renders rather than a strict mesh.
 
 ---
 
 ## What runs end-to-end today
 
 **LiDAR branch:** `step1 → step3 → step4 → step6` → `mesh.ply` (LiDAR-only, coarse).
-**Image branch:** `step0 → step_b1 → step_b2 → step_b3 → step_b4` → `image_cloud.npz`
-(dense colored cloud in the refined odom frame). **Phase C** (`step_c_fuse`) merges
-LiDAR + image → `fused_cloud` (1.27 M voxels); **Phase D** (`step_d_mesh`, TSDF) → `mesh_fused.ply`
-(614 k tris, flat walls + floor). Phase E (texture) is the remaining work to make it look good.
+**Image branch:** `step0 → step_b1 → step_b2 (DepthPro) → step_b3 → step_b3b → step_b4`.
+**Phase D** (`step_d_mesh`, TSDF gated by B3b consistency) → `mesh_fused.ply`
+(~918 k tris; distinct objects, clean walls, floor). The Poisson path + Phase C
+`fused_cloud` remain for the point-cloud route. Phase E (texture) is next.
 
 ## Immediate next decisions
 

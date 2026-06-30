@@ -41,15 +41,19 @@ import step6_mesh as step6
 
 
 # --- TSDF tunables ----------------------------------------------------------
-TSDF_VOXEL = 0.03            # SDF voxel (m): smaller=more detail+noise
-TSDF_TRUNC = 0.12            # truncation distance (~4x voxel)
+# These assume B3b multi-view consistency has run: Camera.confidence() folds in
+# the consistency weight (inconsistent monocular pixels -> 0), which is the
+# primary gate. That lets us drop CONF_THR low and use a finer voxel without the
+# fusion turning to noise -> sharper, cleaner objects (table/box).
+TSDF_VOXEL = 0.02            # SDF voxel (m): finer now that input is consistent
+TSDF_TRUNC = 0.06            # truncation distance (~3x voxel)
 DEPTH_TRUNC = 8.0            # ignore depth beyond this (m)
 MIN_QUALITY = 0.35           # skip frames with B3 fit_quality below this
-CONF_THR = 0.45              # zero out pixels below this confidence (cuts fringe)
+CONF_THR = 0.12              # consistency is the real gate; keep confirmed pixels
 
 # --- shared cleanup ---------------------------------------------------------
 MIN_COMPONENT_TRIS = 2000    # drop connected components smaller than this
-TAUBIN_ITERS = 8             # volume-preserving smoothing passes
+TAUBIN_ITERS = 5             # volume-preserving smoothing (less now input is clean)
 TARGET_TRIANGLES = 0         # quadric-decimation target (0 = keep full detail)
 
 # --- Poisson (baseline) tunables --------------------------------------------

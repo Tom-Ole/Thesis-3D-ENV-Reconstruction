@@ -384,6 +384,8 @@ class Camera:
     align_quality: float | None = None  # per-image fit_quality in [0, 1]
     align_anchor_zmax: float | None = None  # range LiDAR validated (m); taper beyond
     depth_aligned_kind: str | None = None  # "metric_aligned_m"
+    # --- Step B3b enrichment (None until step_b3b_consistency.py has run) -----
+    consistency_path: str | None = None  # per-pixel multi-view weight map (.npy)
 
     @property
     def t_sec(self) -> float:
@@ -481,6 +483,15 @@ class Camera:
             zt = self.align_anchor_zmax
             over = np.clip((zc - zt) / (0.5 * zt), 0.0, 1.0)  # 1@zt -> 0@1.5zt
             conf = conf * (1.0 - over)
+        if self.consistency_path:
+            # B3b multi-view consistency weight (0 = inconsistent monocular guess
+            # -> culled from fusion). Resized to the depth grid if needed.
+            w = np.load(self.consistency_path).astype(np.float32) / 255.0
+            if w.shape != conf.shape:
+                import cv2
+                w = cv2.resize(w, (conf.shape[1], conf.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+            conf = conf * w
         return conf.astype(np.float32)
 
     def project(self, pts_odom: np.ndarray):
@@ -535,6 +546,7 @@ def load_camera_manifest(data_root: str):
     _merge_image_poses(root, cams)
     _merge_depth(root, cams)
     _merge_align(root, cams)
+    _merge_consistency(root, cams)
     return cams
 
 
@@ -595,6 +607,20 @@ def _merge_align(root: str, cams: list):
         cam.align_anchor_zmax = (float(a["anchor_zmax"])
                                  if a.get("anchor_zmax") is not None else None)
         cam.depth_aligned_kind = kind
+
+
+def _merge_consistency(root: str, cams: list):
+    """Fold Step B3b's consistency.json (if present) into the Camera records."""
+    path = os.path.join(root, "output", "depth", "consistency.json")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        data = json.load(f)
+    by_src = {d["source_image"]: d for d in data.get("images", [])}
+    for cam in cams:
+        d = by_src.get(cam.source_image)
+        if d is not None:
+            cam.consistency_path = d["path"]
 
 def load_image_cloud(data_root: str):
     """Load Step B4's dense image cloud -> (points, colors, normals, confidence).

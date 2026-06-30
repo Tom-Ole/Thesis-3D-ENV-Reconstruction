@@ -38,16 +38,25 @@ import cv2
 import common
 
 
-MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+# Selectable HF depth-estimation backends (all expose the same metric-depth
+# infer() path, so swapping is a one-line change). DepthPro has noticeably
+# sharper object boundaries than DA-V2 (still monocular, so still not multi-view
+# consistent — see todo.md Phase D diagnosis).
+MODELS = {
+    "dav2": "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+    "depthpro": "apple/DepthPro-hf",
+}
+MODEL_ID = MODELS["dav2"]
 
 
 # --- Depth backend ----------------------------------------------------------
 
-class DepthAnythingV2Metric:
-    """Depth Anything V2 (metric indoor) wrapped to: BGR uint8 -> depth (H,W) m.
+class HFDepthBackend:
+    """Any HF AutoModelForDepthEstimation wrapped to: BGR uint8 -> depth (H,W) m.
 
-    Lazy-loads the model on first use so importing this module stays cheap.
-    Runs in fp16 on CUDA when available; the output is metric depth in metres.
+    Works for Depth Anything V2 (metric) and DepthPro alike — identical infer
+    path. Lazy-loads on first use; runs fp16 on CUDA; output is metric metres
+    (B3 re-anchors scale anyway, so an approximate model scale is fine).
     """
 
     depth_kind = "metric_m"
@@ -146,7 +155,7 @@ def run(data_root: str, model_id: str = MODEL_ID, device: str | None = None,
     if limit:
         cams = cams[:limit]
 
-    backend = DepthAnythingV2Metric(model_id, device).load()
+    backend = HFDepthBackend(model_id, device).load()
     dataset = common.SessionDataset(data_root) if overlay else None
 
     out_dir = os.path.join(os.path.abspath(data_root), "output", "depth")
@@ -219,7 +228,7 @@ def run(data_root: str, model_id: str = MODEL_ID, device: str | None = None,
 def main():
     data_root = "./captures/session_05_20260624"
 
-    model_id = MODEL_ID
+    model_id = MODELS["depthpro"]   # "dav2" | "depthpro" (sharper objects)
     device = None           # None -> CUDA if available, else CPU
 
     overlay = True          # write colourised depth + LiDAR cross-check

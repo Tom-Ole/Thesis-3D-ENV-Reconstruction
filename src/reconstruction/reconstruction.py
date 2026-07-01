@@ -1,32 +1,45 @@
 """
 Handles the Reconstruction from the (preprocessed) data (Images and/or LiDAR, and Spots Odometry/IMU)
 """
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
 
 class Reconstruction:
 
-    def __init__(self):
-        pass
+    def __init__(self, session_dir: Path, output_dir: Optional[Path] = None, show: bool = True):
+        self.session_dir = Path(session_dir)
+        self.output_dir = Path(output_dir) if output_dir else self.session_dir / "output"
+        self.show = show
+        self.step1_dir: Optional[Path] = None
+        self.step2_dir: Optional[Path] = None
+        self.step3_dir: Optional[Path] = None
 
     # Optional
     def data_preprocess(self):
         """
-        Handles the preprocessesing stepfrom `../preprocessing/preprocessing.py` 
-        if its not already done in the preprocess tab.
+        **STEP 0:** Sensor Preprocessing (Calibration + Synchronization)
+
+        Not a separate stage here: Step 1 reads the raw capture session
+        directly (see src/reconstruction/common.py) and resolves each scan's
+        pose straight from its own capture metadata, so there is nothing to
+        precompute. Kept as a no-op for interface compatibility with the
+        original step list.
         """
         pass
 
     def lidar_icp(self):
-        """ 
-        **STEP 0:** Sensor Preprocessing (Lidar ICP)... \n
-        *Output:* \\
-        Synchronized dataset:
-        - (RGB_t, LiDAR_t, Pose_t_initial) \n
-
+        """
         **STEP 1:** Odometry Refinement (Lidar ICP)... \n
         *Output:* \\
         Refined relative poses between keyframes
         """
-        pass
+        from src.reconstruction.lidar_icp import run_step1
+
+        self.step1_dir = run_step1(self.session_dir, self.output_dir / "step1", show=self.show)
+        return self.step1_dir
 
     def pose_graph(self):
         """
@@ -34,7 +47,10 @@ class Reconstruction:
         *Output:* \\
         Globally consistent trajectory
         """
-        pass
+        from src.reconstruction.pose_graph import run_step2
+
+        self.step2_dir = run_step2(self.session_dir, self.output_dir / "step2", show=self.show)
+        return self.step2_dir
 
     def fusion_mapping(self):
         """
@@ -48,11 +64,14 @@ class Reconstruction:
         **STEP 3.2:** TSDF Volume Integration (Coarse Geometry)... 
         *Output:* \\
         Watertight coarse geometry representation \n
-        **STEP 3.3:** Surface Normals and Confidence Estimation... 
+        **STEP 3.3:** Surface Normals and Confidence Estimation...
         *Output:* \\
         Normal + confidence field for surface reliability
         """
-        pass
+        from src.reconstruction.fusion import run_step3
+
+        self.step3_dir = run_step3(self.session_dir, self.output_dir / "step3", show=self.show)
+        return self.step3_dir
 
     def structure_decomposition(self):
         """

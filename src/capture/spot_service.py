@@ -40,7 +40,7 @@ from src.capture.image_client import ImageClientWrapper
 from src.capture.lidar_client import PointCloudClientWrapper
 from src.capture.state_client import StateClientWrapper
 from src.config import Config
-from src.models import (
+from src.data_models import (
     CapturedImage,
     CapturedPointCloud,
     ConnectionStatus,

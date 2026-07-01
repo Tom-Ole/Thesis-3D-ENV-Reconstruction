@@ -19,7 +19,7 @@ from bosdyn.api import point_cloud_pb2
 from bosdyn.client.point_cloud import PointCloudClient
 from google.protobuf import json_format
 
-from src.models import CapturedPointCloud, PointCloudSourceInfo
+from src.data_models import CapturedPointCloud, PointCloudSourceInfo
 
 logger = logging.getLogger(__name__)
 

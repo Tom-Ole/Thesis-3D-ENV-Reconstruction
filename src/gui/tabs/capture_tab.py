@@ -40,7 +40,7 @@ from src.gui.workers import (
     FunctionWorker,
     StateRecorderWorker,
 )
-from src.models import (
+from src.data_models import (
     CaptureBatchResult,
     ConnectResult,
 )

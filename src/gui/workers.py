@@ -13,7 +13,7 @@ import time
 
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
-from src.models import CAPTURE_TYPE_IMAGE
+from src.data_models import CAPTURE_TYPE_IMAGE
 
 logger = logging.getLogger(__name__)
 

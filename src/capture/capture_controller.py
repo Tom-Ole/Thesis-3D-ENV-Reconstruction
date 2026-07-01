@@ -20,7 +20,7 @@ from src.capture.capture_session import (
 from src.capture.spot_service import SpotService
 from src.capture.writter import DiskWriter
 from src.config import Config
-from src.models import (
+from src.data_models import (
     CAPTURE_TYPE_IMAGE,
     CAPTURE_TYPE_POINTCLOUD,
     CaptureBatchResult,

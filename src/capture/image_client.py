@@ -15,7 +15,7 @@ from bosdyn.api import image_pb2
 from bosdyn.client.image import ImageClient, build_image_request
 from google.protobuf import json_format
 
-from src.models import CapturedImage, ImageSourceInfo
+from src.data_models import CapturedImage, ImageSourceInfo
 
 logger = logging.getLogger(__name__)
 
